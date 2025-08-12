@@ -1,43 +1,38 @@
 use bitcoin::hashes::sha256d;
 use bitcoin_jsonrpsee::jsonrpsee;
 use fatality::fatality;
+use sneed::{db, env, rwtxn};
 use thiserror::Error;
+use transitive::Transitive;
 
 use crate::{
     errors::Splittable,
     messages::CoinbaseMessagesError,
     types::SidechainNumber,
-    validator::{
-        dbs::{self, db_error},
-        main_rest_client::MainRestClientError,
-    },
+    validator::{dbs, main_rest_client::MainRestClientError},
 };
 
 #[fatality(splitable)]
 pub(in crate::validator) enum HandleM1ProposeSidechain {
     #[error(transparent)]
     #[fatal]
-    DbPut(#[from] db_error::Put),
+    DbPut(#[from] db::error::Put),
     #[error(transparent)]
     #[fatal]
-    DbTryGet(#[from] db_error::TryGet),
+    DbTryGet(#[from] db::error::TryGet),
 }
 
-#[allow(clippy::enum_variant_names)]
+#[derive(Transitive)]
 #[fatality(splitable)]
+#[transitive(
+    from(db::error::Delete, db::Error),
+    from(db::error::Put, db::Error),
+    from(db::error::TryGet, db::Error)
+)]
 pub(in crate::validator) enum HandleM2AckSidechain {
     #[error(transparent)]
     #[fatal]
-    DbDelete(#[from] db_error::Delete),
-    #[error(transparent)]
-    #[fatal]
-    DbPut(#[from] db_error::Put),
-    #[error(transparent)]
-    #[fatal]
-    DbTryGet(#[from] db_error::TryGet),
-    #[error(transparent)]
-    #[fatal]
-    PutActiveSidechain(#[from] dbs::PutActiveSidechainError),
+    Db(Box<db::Error>),
     #[error("Missing sidechain proposal for slot `{sidechain_slot}`: `{description_hash}`")]
     MissingProposal {
         sidechain_slot: SidechainNumber,
@@ -45,25 +40,37 @@ pub(in crate::validator) enum HandleM2AckSidechain {
     },
 }
 
+impl From<db::Error> for HandleM2AckSidechain {
+    fn from(err: db::Error) -> Self {
+        Self::Db(Box::new(err))
+    }
+}
+
 #[allow(clippy::enum_variant_names)]
+#[derive(Transitive)]
 #[fatality(splitable)]
+#[transitive(
+    from(db::error::Delete, db::Error),
+    from(db::error::Iter, db::Error),
+    from(db::error::TryGet, db::Error)
+)]
 pub(in crate::validator) enum HandleFailedSidechainProposals {
     #[error(transparent)]
     #[fatal]
-    DbDelete(#[from] db_error::Delete),
-    #[error(transparent)]
-    #[fatal]
-    DbIter(#[from] db_error::Iter),
-    #[error(transparent)]
-    #[fatal]
-    DbTryGet(#[from] db_error::TryGet),
+    Db(Box<db::Error>),
+}
+
+impl From<db::Error> for HandleFailedSidechainProposals {
+    fn from(err: db::Error) -> Self {
+        Self::Db(Box::new(err))
+    }
 }
 
 #[fatality(splitable)]
 pub(in crate::validator) enum HandleM3ProposeBundle {
     #[error(transparent)]
     #[fatal]
-    TryPutPendingM6id(#[from] dbs::TryWithPendingWithdrawalsError),
+    Db(Box<db::Error>),
     #[error(
         "Cannot propose bundle; sidechain slot {} is inactive",
         .sidechain_number.0
@@ -71,10 +78,22 @@ pub(in crate::validator) enum HandleM3ProposeBundle {
     InactiveSidechain { sidechain_number: SidechainNumber },
 }
 
+impl From<db::Error> for HandleM3ProposeBundle {
+    fn from(err: db::Error) -> Self {
+        Self::Db(Box::new(err))
+    }
+}
+
+#[derive(Transitive)]
 #[fatality(splitable)]
+#[transitive(
+    from(db::error::IterInit, db::Error),
+    from(db::error::IterItem, db::Error)
+)]
 pub(in crate::validator) enum HandleM4Votes {
     #[error(transparent)]
-    DbIter(#[from] db_error::Iter),
+    #[fatal]
+    Db(Box<db::Error>),
     #[error("Invalid votes: expected {expected}, but found {len}")]
     InvalidVotes { expected: usize, len: usize },
     #[error(
@@ -86,12 +105,12 @@ pub(in crate::validator) enum HandleM4Votes {
         sidechain_number: SidechainNumber,
         index: u16,
     },
-    #[error(transparent)]
-    #[fatal]
-    TryAlarmPendingM6ids(dbs::TryWithPendingWithdrawalsError),
-    #[error(transparent)]
-    #[fatal]
-    TryUpvotePendingM6id(#[from] dbs::TryUpvotePendingWithdrawalError),
+}
+
+impl From<db::Error> for HandleM4Votes {
+    fn from(err: db::Error) -> Self {
+        Self::Db(Box::new(err))
+    }
 }
 
 #[fatality(splitable)]
@@ -105,26 +124,34 @@ pub(in crate::validator) enum HandleM4AckBundles {
 pub(in crate::validator) enum HandleFailedM6Ids {
     #[error(transparent)]
     #[fatal]
-    RetainPendingWithdrawals(#[from] dbs::RetainPendingWithdrawalsError),
+    Db(Box<db::Error>),
 }
 
+impl From<db::Error> for HandleFailedM6Ids {
+    fn from(err: db::Error) -> Self {
+        Self::Db(Box::new(err))
+    }
+}
+
+#[derive(Transitive)]
 #[fatality(splitable)]
+#[transitive(from(db::error::TryGet, db::Error))]
 pub(in crate::validator) enum HandleM5M6 {
     #[error(transparent)]
     #[fatal]
-    DbTryGet(#[from] db_error::TryGet),
+    Db(Box<db::Error>),
     #[error("Invalid M6")]
     InvalidM6,
     #[error(transparent)]
     M6id(#[from] crate::messages::M6idError),
     #[error("Old Ctip for sidechain {} is unspent", .sidechain_number.0)]
     OldCtipUnspent { sidechain_number: SidechainNumber },
-    #[error(transparent)]
-    #[fatal]
-    PutCtip(#[from] dbs::PutCtipError),
-    #[error(transparent)]
-    #[fatal]
-    TryWithPendingWithdrawals(#[from] dbs::TryWithPendingWithdrawalsError),
+}
+
+impl From<db::Error> for HandleM5M6 {
+    fn from(err: db::Error) -> Self {
+        Self::Db(Box::new(err))
+    }
 }
 
 #[fatality(splitable)]
@@ -148,13 +175,13 @@ pub(in crate::validator) enum HandleTransaction {
 #[derive(Debug, Error)]
 pub(in crate::validator::task) enum ValidateTransactionInner {
     #[error(transparent)]
-    DbTryGet(#[from] db_error::TryGet),
+    DbTryGet(#[from] db::error::TryGet),
+    #[error(transparent)]
+    NestedWriteTxn(#[from] env::error::NestedWriteTxn),
     #[error("No chain tip")]
     NoChainTip,
     #[error(transparent)]
     Transaction(#[from] <HandleTransaction as fatality::Split>::Fatal),
-    #[error(transparent)]
-    WriteTxn(#[from] dbs::WriteTxnError),
 }
 
 #[derive(Debug, Error)]
@@ -171,7 +198,16 @@ where
     }
 }
 
+#[derive(Transitive)]
 #[fatality(splitable)]
+#[transitive(
+    from(db::error::Delete, db::Error),
+    from(db::error::First, db::Error),
+    from(db::error::Get, db::Error),
+    from(db::error::Len, db::Error),
+    from(db::error::Put, db::Error),
+    from(db::error::TryGet, db::Error)
+)]
 pub(in crate::validator) enum ConnectBlock {
     #[error("Block parent `{parent}` does not match tip `{tip}` at height {tip_height}")]
     BlockParent {
@@ -183,25 +219,7 @@ pub(in crate::validator) enum ConnectBlock {
     CoinbaseMessages(#[from] CoinbaseMessagesError),
     #[error(transparent)]
     #[fatal]
-    PutBlockInfo(#[from] dbs::block_hash_dbs_error::PutBlockInfo),
-    #[error(transparent)]
-    #[fatal]
-    DbDelete(#[from] db_error::Delete),
-    #[error(transparent)]
-    #[fatal]
-    DbFirst(#[from] db_error::First),
-    #[error(transparent)]
-    #[fatal]
-    DbGet(#[from] db_error::Get),
-    #[error(transparent)]
-    #[fatal]
-    DbLen(#[from] db_error::Len),
-    #[error(transparent)]
-    #[fatal]
-    DbPut(#[from] db_error::Put),
-    #[error(transparent)]
-    #[fatal]
-    DbTryGet(#[from] db_error::TryGet),
+    Db(Box<db::Error>),
     #[error("Error handling failed M6IDs")]
     #[fatal(forward)]
     FailedM6Ids(#[from] HandleFailedM6Ids),
@@ -223,8 +241,17 @@ pub(in crate::validator) enum ConnectBlock {
     #[error("Multiple blocks BMM'd in sidechain slot {}", .sidechain_number.0)]
     MultipleBmmBlocks { sidechain_number: SidechainNumber },
     #[error(transparent)]
+    #[fatal]
+    PutBlockInfo(#[from] dbs::block_hash_dbs_error::PutBlockInfo),
+    #[error(transparent)]
     #[fatal(forward)]
     Transaction(#[from] HandleTransaction),
+}
+
+impl From<db::Error> for ConnectBlock {
+    fn from(err: db::Error) -> Self {
+        Self::Db(Box::new(err))
+    }
 }
 
 #[derive(Debug, Error)]
@@ -236,29 +263,34 @@ impl fatality::Fatality for DisconnectBlock {
     }
 }
 
+#[derive(Transitive)]
 #[fatality(splitable)]
+#[transitive(
+    from(db::error::Get, db::Error),
+    from(db::error::Put, db::Error),
+    from(db::error::TryGet, db::Error),
+    from(env::error::ReadTxn, env::Error),
+    from(env::error::WriteTxn, env::Error)
+)]
 pub(in crate::validator) enum Sync {
     #[error("Block not in active chain: `{block_hash}`")]
     #[fatal]
     BlockNotInActiveChain { block_hash: bitcoin::BlockHash },
     #[error(transparent)]
     #[fatal]
-    CommitWriteTxn(#[from] dbs::CommitWriteTxnError),
+    CommitWriteTxn(#[from] rwtxn::error::Commit),
     #[error(transparent)]
     #[fatal(forward)]
     ConnectBlock(Box<Splittable<ConnectBlock>>),
     #[error(transparent)]
     #[fatal]
-    DbGet(#[from] db_error::Get),
-    #[error(transparent)]
-    #[fatal]
-    DbPut(#[from] db_error::Put),
-    #[error(transparent)]
-    #[fatal]
-    DbTryGet(#[from] db_error::TryGet),
+    Db(#[from] db::Error),
     #[error(transparent)]
     #[fatal(forward)]
     DisconnectBlock(#[from] DisconnectBlock),
+    #[error(transparent)]
+    #[fatal]
+    Env(#[from] env::Error),
     #[error(transparent)]
     #[fatal]
     GetHeaderInfo(#[from] dbs::block_hash_dbs_error::GetHeaderInfo),
@@ -275,19 +307,10 @@ pub(in crate::validator) enum Sync {
     LastCommonAncestor(#[from] dbs::block_hash_dbs_error::LastCommonAncestor),
     #[error(transparent)]
     #[fatal]
-    ReadTxn(#[from] dbs::ReadTxnError),
-    #[error(transparent)]
-    #[fatal]
     Rest(#[from] MainRestClientError),
     #[error("Shutdown signal received")]
     #[fatal]
     Shutdown,
-    #[error(transparent)]
-    #[fatal]
-    TryGetHeaderInfo(#[from] dbs::block_hash_dbs_error::TryGetHeaderInfo),
-    #[error(transparent)]
-    #[fatal]
-    WriteTxn(#[from] dbs::WriteTxnError),
 }
 
 impl From<ConnectBlock> for Sync {
@@ -303,7 +326,7 @@ pub(in crate::validator::task) enum FatalInner {
     #[error(transparent)]
     Sync(#[from] <Sync as fatality::Split>::Fatal),
     #[error(transparent)]
-    WriteTxn(#[from] dbs::WriteTxnError),
+    WriteTxn(#[from] env::error::WriteTxn),
     #[error(transparent)]
     Zmq(#[from] zeromq::ZmqError),
     #[error(transparent)]

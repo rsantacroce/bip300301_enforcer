@@ -1,22 +1,25 @@
-use std::time::Instant;
+use std::{
+    collections::{HashMap, HashSet},
+    time::Instant,
+};
 
-use bitcoin::{block::Header, hashes::Hash as _, BlockHash, Txid, Work};
+use bitcoin::{BlockHash, Txid, Work, block::Header, hashes::Hash as _};
 use fallible_iterator::FallibleIterator;
-use heed::{types::SerdeBincode, RoTxn};
+use heed_types::SerdeBincode;
 use nonempty::NonEmpty;
+use sneed::{DatabaseDup, DatabaseUnique, Env, RoDatabaseUnique, RoTxn, RwTxn, db, env};
 use tracing::instrument;
 
-use super::util::RoDatabase;
-use crate::{
-    types::{BlockEvent, BlockInfo, BmmCommitments, HeaderInfo, TwoWayPegData},
-    validator::dbs::util::{db_error, CreateDbError, Database, Env, RwTxn},
+use crate::types::{
+    BlockEvent, BlockInfo, BmmCommitment, BmmCommitments, HeaderInfo, SidechainNumber,
+    TwoWayPegData,
 };
 
 pub mod error {
     use bitcoin::BlockHash;
+    use sneed::db;
     use thiserror::Error;
-
-    use crate::validator::dbs::util::db_error;
+    use transitive::Transitive;
 
     #[derive(Debug, Error)]
     #[error("Missing header info for block hash `{block_hash}`")]
@@ -31,16 +34,21 @@ pub mod error {
         pub(super) prev_block_hash: BlockHash,
     }
 
-    #[derive(Debug, Error)]
+    #[derive(Debug, Error, Transitive)]
+    #[transitive(from(db::error::Put, db::Error), from(db::error::TryGet, db::Error))]
     pub(in crate::validator::dbs::block_hashes) enum PutBlockInfoInner {
         #[error(transparent)]
-        DbPut(#[from] db_error::Put),
-        #[error(transparent)]
-        DbTryGet(#[from] db_error::TryGet),
+        Db(Box<db::Error>),
         #[error(transparent)]
         MissingHeader(#[from] MissingHeader),
         #[error(transparent)]
         MissingParent(#[from] MissingParent),
+    }
+
+    impl From<db::Error> for PutBlockInfoInner {
+        fn from(err: db::Error) -> Self {
+            Self::Db(Box::new(err))
+        }
     }
 
     #[derive(Debug, Error)]
@@ -56,12 +64,11 @@ pub mod error {
         }
     }
 
-    #[derive(Debug, Error)]
+    #[derive(Debug, Error, Transitive)]
+    #[transitive(from(db::error::Get, db::Error), from(db::error::TryGet, db::Error))]
     pub(crate) enum LastCommonAncestor {
         #[error(transparent)]
-        DbGet(#[from] db_error::Get),
-        #[error(transparent)]
-        DbTryGet(#[from] db_error::TryGet),
+        Db(#[from] db::Error),
         #[error(
             "Missing ancestor at depth {} for {} (height={})",
             .depth,
@@ -76,47 +83,25 @@ pub mod error {
     }
 
     #[derive(Debug, Error)]
-    pub(crate) enum TryGetHeaderInfo {
-        #[error(transparent)]
-        DbTryGet(#[from] db_error::TryGet),
-        #[error(transparent)]
-        InconsistentDbs(#[from] db_error::InconsistentDbs),
-    }
-
-    #[derive(Debug, Error)]
     pub(crate) enum GetHeaderInfo {
         #[error(transparent)]
+        Db(#[from] db::Error),
+        #[error(transparent)]
         MissingHeader(#[from] MissingHeader),
-        #[error(transparent)]
-        TryGetHeaderInfo(#[from] TryGetHeaderInfo),
-    }
-
-    #[derive(Debug, Error)]
-    pub(crate) enum TryGetBlockInfo {
-        #[error(transparent)]
-        DbTryGet(#[from] db_error::TryGet),
-        #[error(transparent)]
-        InconsistentDbs(#[from] db_error::InconsistentDbs),
     }
 
     #[derive(Debug, Error)]
     pub(crate) enum GetBlockInfo {
+        #[error(transparent)]
+        Db(#[from] db::Error),
         #[error("Missing block info for block hash `{block_hash}`")]
         MissingValue { block_hash: BlockHash },
-        #[error(transparent)]
-        TryGetBlockInfo(#[from] TryGetBlockInfo),
-    }
-
-    #[derive(Debug, Error)]
-    pub(crate) enum TryGetTwoWayPegData {
-        #[error(transparent)]
-        TryGetBlockInfo(#[from] TryGetBlockInfo),
-        #[error(transparent)]
-        TryGetHeaderInfo(#[from] TryGetHeaderInfo),
     }
 
     #[derive(Debug, Error)]
     pub(crate) enum GetTwoWayPegDataRange {
+        #[error(transparent)]
+        Db(#[from] db::Error),
         #[error("End block `{end_block}` not found")]
         EndBlockNotFound { end_block: BlockHash },
         #[error("Previous block `{prev_block}` not found for block `{block}`")]
@@ -133,8 +118,6 @@ pub mod error {
             start_block: BlockHash,
             end_block: BlockHash,
         },
-        #[error(transparent)]
-        TryGetTwoWayPegData(#[from] TryGetTwoWayPegData),
     }
 }
 
@@ -142,33 +125,42 @@ pub mod error {
 pub struct BlockHashDbs {
     // All ancestors for each block MUST exist in this DB.
     // All keys in this DB MUST also exist in ALL other DBs.
-    bmm_commitments: Database<SerdeBincode<BlockHash>, SerdeBincode<BmmCommitments>>,
+    bmm_commitments: DatabaseUnique<SerdeBincode<BlockHash>, SerdeBincode<BmmCommitments>>,
     // All ancestors for each block MUST exist in this DB.
     // All keys in this DB MUST also exist in ALL other DBs.
-    coinbase_txid: Database<SerdeBincode<BlockHash>, SerdeBincode<Txid>>,
+    coinbase_txid: DatabaseUnique<SerdeBincode<BlockHash>, SerdeBincode<Txid>>,
     // All ancestors for each block MUST exist in this DB.
     // All keys in this DB MUST also exist in ALL other DBs.
-    cumulative_work: Database<SerdeBincode<BlockHash>, SerdeBincode<Work>>,
+    cumulative_work: DatabaseUnique<SerdeBincode<BlockHash>, SerdeBincode<Work>>,
     // All ancestors for each block MUST exist in this DB.
     // All keys in this DB MUST also exist in ALL other DBs.
-    events: Database<SerdeBincode<BlockHash>, SerdeBincode<Vec<BlockEvent>>>,
+    events: DatabaseUnique<SerdeBincode<BlockHash>, SerdeBincode<Vec<BlockEvent>>>,
     // All keys in this DB MUST also exist in `height`
-    header: Database<SerdeBincode<BlockHash>, SerdeBincode<Header>>,
+    header: DatabaseUnique<SerdeBincode<BlockHash>, SerdeBincode<Header>>,
     // All keys in this DB MUST also exist in `header` as keys AND/OR
     // `prev_blockhash` in a value
-    height: Database<SerdeBincode<BlockHash>, SerdeBincode<u32>>,
+    height: DatabaseUnique<SerdeBincode<BlockHash>, SerdeBincode<u32>>,
+    // Used for determining conflicts for mempool txs.
+    // Maps block hash and sidechain number to a set of txids and their h*
+    // commitments.
+    #[allow(clippy::type_complexity)]
+    seen_bmm_request_txs: DatabaseDup<
+        SerdeBincode<(BlockHash, SidechainNumber)>,
+        SerdeBincode<(Txid, BmmCommitment)>,
+    >,
 }
 
 impl BlockHashDbs {
-    pub const NUM_DBS: u32 = 6;
+    pub const NUM_DBS: u32 = 7;
 
-    pub(super) fn new(env: &Env, rwtxn: &mut RwTxn) -> Result<Self, CreateDbError> {
-        let bmm_commitments = env.create_db(rwtxn, "block_hash_to_bmm_commitments")?;
-        let coinbase_txid = env.create_db(rwtxn, "block_hash_to_coinbase_txid")?;
-        let cumulative_work = env.create_db(rwtxn, "block_hash_to_cumulative_work")?;
-        let events = env.create_db(rwtxn, "block_hash_to_events")?;
-        let header = env.create_db(rwtxn, "block_hash_to_header")?;
-        let height = env.create_db(rwtxn, "block_hash_to_height")?;
+    pub(super) fn new(env: &Env, rwtxn: &mut RwTxn) -> Result<Self, env::error::CreateDb> {
+        let bmm_commitments = DatabaseUnique::create(env, rwtxn, "block_hash_to_bmm_commitments")?;
+        let coinbase_txid = DatabaseUnique::create(env, rwtxn, "block_hash_to_coinbase_txid")?;
+        let cumulative_work = DatabaseUnique::create(env, rwtxn, "block_hash_to_cumulative_work")?;
+        let events = DatabaseUnique::create(env, rwtxn, "block_hash_to_events")?;
+        let header = DatabaseUnique::create(env, rwtxn, "block_hash_to_header")?;
+        let height = DatabaseUnique::create(env, rwtxn, "block_hash_to_height")?;
+        let seen_bmm_request_txs = DatabaseDup::create(env, rwtxn, "seen_bmm_request_txs")?;
         Ok(Self {
             bmm_commitments,
             coinbase_txid,
@@ -176,20 +168,21 @@ impl BlockHashDbs {
             events,
             header,
             height,
+            seen_bmm_request_txs,
         })
     }
 
     pub fn bmm_commitments(
         &self,
-    ) -> RoDatabase<SerdeBincode<BlockHash>, SerdeBincode<BmmCommitments>> {
+    ) -> RoDatabaseUnique<SerdeBincode<BlockHash>, SerdeBincode<BmmCommitments>> {
         (*self.bmm_commitments).clone()
     }
 
-    pub fn cumulative_work(&self) -> RoDatabase<SerdeBincode<BlockHash>, SerdeBincode<Work>> {
+    pub fn cumulative_work(&self) -> RoDatabaseUnique<SerdeBincode<BlockHash>, SerdeBincode<Work>> {
         (*self.cumulative_work).clone()
     }
 
-    pub fn height(&self) -> RoDatabase<SerdeBincode<BlockHash>, SerdeBincode<u32>> {
+    pub fn height(&self) -> RoDatabaseUnique<SerdeBincode<BlockHash>, SerdeBincode<u32>> {
         (*self.height).clone()
     }
 
@@ -198,7 +191,7 @@ impl BlockHashDbs {
         &self,
         rotxn: &RoTxn,
         block_hash: &BlockHash,
-    ) -> Result<bool, db_error::TryGet> {
+    ) -> Result<bool, db::error::TryGet> {
         self.header.contains_key(rotxn, block_hash)
     }
 
@@ -208,7 +201,7 @@ impl BlockHashDbs {
         &self,
         rwtxn: &mut RwTxn,
         headers: &[(Header, u32)],
-    ) -> Result<(), db_error::Put> {
+    ) -> Result<(), db::error::Put> {
         let start = Instant::now();
 
         for (header, height) in headers {
@@ -277,7 +270,7 @@ impl BlockHashDbs {
         &'a self,
         rotxn: &'a RoTxn<'_>,
         mut block_hash: BlockHash,
-    ) -> impl FallibleIterator<Item = (BlockHash, Header), Error = db_error::TryGet> + 'a {
+    ) -> impl FallibleIterator<Item = (BlockHash, Header), Error = db::error::TryGet> + 'a {
         fallible_iterator::from_fn(move || {
             let header = self.header.try_get(rotxn, &block_hash)?;
             if let Some(header) = header {
@@ -365,14 +358,18 @@ impl BlockHashDbs {
         &self,
         rotxn: &RoTxn,
         block_hash: &BlockHash,
-    ) -> Result<Option<HeaderInfo>, error::TryGetHeaderInfo> {
+    ) -> Result<Option<HeaderInfo>, db::Error> {
         let Some(header) = self.header.try_get(rotxn, block_hash)? else {
             return Ok(None);
         };
         assert_eq!(header.block_hash(), *block_hash);
         let Some(height) = self.height.try_get(rotxn, block_hash)? else {
-            let err = db_error::InconsistentDbs::new(block_hash, &self.header, &self.height);
-            return Err(error::TryGetHeaderInfo::InconsistentDbs(err));
+            let err = db::error::inconsistent::Xor::new(
+                block_hash,
+                db::error::inconsistent::ByKey(&*self.header),
+                db::error::inconsistent::ByKey(&*self.height),
+            );
+            return Err(db::Error::Inconsistent(err.into()));
         };
         let header_info = HeaderInfo {
             block_hash: header.block_hash(),
@@ -405,7 +402,7 @@ impl BlockHashDbs {
         rotxn: &RoTxn,
         block_hash: &BlockHash,
         max_ancestors: usize,
-    ) -> Result<Option<NonEmpty<HeaderInfo>>, error::TryGetHeaderInfo> {
+    ) -> Result<Option<NonEmpty<HeaderInfo>>, db::Error> {
         let Some(header_info) = self.try_get_header_info(rotxn, block_hash)? else {
             return Ok(None);
         };
@@ -427,22 +424,25 @@ impl BlockHashDbs {
         &self,
         rotxn: &RoTxn,
         block_hash: &BlockHash,
-    ) -> Result<Option<BlockInfo>, error::TryGetBlockInfo> {
+    ) -> Result<Option<BlockInfo>, db::Error> {
         let Some(bmm_commitments) = self.bmm_commitments.try_get(rotxn, block_hash)? else {
             return Ok(None);
         };
         let Some(coinbase_txid) = self.coinbase_txid.try_get(rotxn, block_hash)? else {
-            let err = db_error::InconsistentDbs::new(
+            let err = db::error::inconsistent::Xor::new(
                 block_hash,
-                &self.bmm_commitments,
-                &self.coinbase_txid,
+                db::error::inconsistent::ByKey(&*self.bmm_commitments),
+                db::error::inconsistent::ByKey(&*self.coinbase_txid),
             );
-            return Err(error::TryGetBlockInfo::InconsistentDbs(err));
+            return Err(db::Error::Inconsistent(err.into()));
         };
         let Some(events) = self.events.try_get(rotxn, block_hash)? else {
-            let err =
-                db_error::InconsistentDbs::new(block_hash, &self.bmm_commitments, &self.events);
-            return Err(error::TryGetBlockInfo::InconsistentDbs(err));
+            let err = db::error::inconsistent::Xor::new(
+                block_hash,
+                db::error::inconsistent::ByKey(&*self.bmm_commitments),
+                db::error::inconsistent::ByKey(&*self.events),
+            );
+            return Err(db::Error::Inconsistent(err.into()));
         };
         let block_info = BlockInfo {
             bmm_commitments,
@@ -469,7 +469,7 @@ impl BlockHashDbs {
         &self,
         rotxn: &RoTxn,
         block_hash: &BlockHash,
-    ) -> Result<Option<TwoWayPegData>, error::TryGetTwoWayPegData> {
+    ) -> Result<Option<TwoWayPegData>, db::Error> {
         let Some(header_info) = self.try_get_header_info(rotxn, block_hash)? else {
             return Ok(None);
         };
@@ -490,10 +490,7 @@ impl BlockHashDbs {
         end_block: BlockHash,
     ) -> Result<Vec<TwoWayPegData>, error::GetTwoWayPegDataRange> {
         let mut res = Vec::new();
-        let Some(two_way_peg_data) = self
-            .try_get_two_way_peg_data(rotxn, &end_block)
-            .map_err(error::GetTwoWayPegDataRange::TryGetTwoWayPegData)?
-        else {
+        let Some(two_way_peg_data) = self.try_get_two_way_peg_data(rotxn, &end_block)? else {
             return Err(error::GetTwoWayPegDataRange::EndBlockNotFound { end_block });
         };
         let mut prev_block = end_block;
@@ -513,9 +510,7 @@ impl BlockHashDbs {
                     break;
                 }
             }
-            let Some(two_way_peg_data) = self
-                .try_get_two_way_peg_data(rotxn, &current_block)
-                .map_err(error::GetTwoWayPegDataRange::TryGetTwoWayPegData)?
+            let Some(two_way_peg_data) = self.try_get_two_way_peg_data(rotxn, &current_block)?
             else {
                 return Err(error::GetTwoWayPegDataRange::PreviousBlockNotFound {
                     block: current_block,
@@ -528,5 +523,68 @@ impl BlockHashDbs {
         }
         res.reverse();
         Ok(res)
+    }
+
+    /// Get seen BMM requests for a given parent block hash and sidechain slot.
+    /// Returns a map of h* commitments to txids.
+    pub fn get_seen_bmm_requests(
+        &self,
+        rotxn: &RoTxn,
+        parent_block_hash: BlockHash,
+        sidechain_slot: SidechainNumber,
+    ) -> Result<HashMap<BmmCommitment, HashSet<Txid>>, db::Error> {
+        self.seen_bmm_request_txs
+            .get(rotxn, &(parent_block_hash, sidechain_slot))?
+            .fold(
+                HashMap::<_, HashSet<_>>::new(),
+                |mut res, (txid, commitment)| {
+                    res.entry(commitment).or_default().insert(txid);
+                    Ok(res)
+                },
+            )
+            .map_err(db::Error::from)
+    }
+
+    /// Get seen BMM requests for a given parent block hash/
+    /// Returns a map of sidechain numbers to h* commitments to txids.
+    pub fn get_seen_bmm_requests_for_parent_block(
+        &self,
+        rotxn: &RoTxn,
+        parent_block_hash: BlockHash,
+    ) -> Result<HashMap<SidechainNumber, HashMap<BmmCommitment, HashSet<Txid>>>, db::error::Range>
+    {
+        self.seen_bmm_request_txs
+            .range_through_duplicate_values(
+                rotxn,
+                &((parent_block_hash, SidechainNumber::MIN)
+                    ..=(parent_block_hash, SidechainNumber::MAX)),
+            )?
+            .fold(
+                HashMap::<_, HashMap<_, HashSet<_>>>::new(),
+                |mut res, ((_parent_block_hash, sidechain_slot), (txid, commitment))| {
+                    res.entry(sidechain_slot)
+                        .or_default()
+                        .entry(commitment)
+                        .or_default()
+                        .insert(txid);
+                    Ok(res)
+                },
+            )
+            .map_err(db::error::Range::from)
+    }
+
+    pub fn put_seen_bmm_request(
+        &self,
+        rwtxn: &mut RwTxn,
+        parent_block_hash: BlockHash,
+        sidechain_slot: SidechainNumber,
+        txid: Txid,
+        commitment: BmmCommitment,
+    ) -> Result<(), db::error::Put> {
+        self.seen_bmm_request_txs.put(
+            rwtxn,
+            &(parent_block_hash, sidechain_slot),
+            &(txid, commitment),
+        )
     }
 }

@@ -1,20 +1,25 @@
-use std::{collections::HashMap, path::Path, sync::Arc};
+use std::{
+    collections::{HashMap, HashSet},
+    path::Path,
+    sync::Arc,
+};
 
-use async_broadcast::{broadcast, InactiveReceiver, Sender as BroadcastSender};
-use bitcoin::{self, Amount, BlockHash, OutPoint};
+use async_broadcast::{InactiveReceiver, Sender as BroadcastSender, broadcast};
+use bitcoin::{self, Amount, BlockHash, OutPoint, Txid};
 use bitcoin_jsonrpsee::jsonrpsee;
 use fallible_iterator::{FallibleIterator, IteratorExt};
-use futures::{stream::FusedStream, StreamExt};
+use futures::{StreamExt, stream::FusedStream};
 use miette::{Diagnostic, IntoDiagnostic};
 use nonempty::NonEmpty;
+use sneed::{db, env};
 use thiserror::Error;
 use tokio::sync::watch::Receiver as WatchReceiver;
 
 use crate::{
-    proto::{mainchain::HeaderSyncProgress, StatusBuilder, ToStatus},
+    proto::{StatusBuilder, ToStatus, mainchain::HeaderSyncProgress},
     types::{
-        BlockInfo, BmmCommitments, Ctip, Event, HeaderInfo, Sidechain, SidechainNumber,
-        SidechainProposalId, TreasuryUtxo, TwoWayPegData,
+        BlockInfo, BmmCommitment, BmmCommitments, Ctip, Event, HeaderInfo, Sidechain,
+        SidechainNumber, SidechainProposalId, TreasuryUtxo, TwoWayPegData,
     },
     validator::main_rest_client::MainRestClient,
 };
@@ -24,12 +29,12 @@ mod dbs;
 pub mod main_rest_client;
 mod task;
 
-use self::dbs::{db_error, CreateDbsError, Dbs, PendingM6ids};
+use self::dbs::{Dbs, PendingM6ids};
 
 #[derive(Debug, Error)]
 pub enum InitError {
     #[error(transparent)]
-    CreateDbs(#[from] CreateDbsError),
+    CreateDbs(#[from] dbs::CreateDbsError),
     #[error("JSON RPC error (`{method}`)")]
     JsonRpc {
         method: String,
@@ -40,9 +45,9 @@ pub enum InitError {
 #[derive(Debug, Diagnostic, Error)]
 pub enum GetCtipSequenceNumberError {
     #[error(transparent)]
-    ReadTxn(#[from] dbs::ReadTxnError),
+    ReadTxn(#[from] env::error::ReadTxn),
     #[error(transparent)]
-    TryGet(#[from] db_error::TryGet),
+    TryGet(#[from] db::error::TryGet),
 }
 
 impl ToStatus for GetCtipSequenceNumberError {
@@ -57,9 +62,9 @@ impl ToStatus for GetCtipSequenceNumberError {
 #[derive(Debug, Diagnostic, Error)]
 pub enum TryGetCtipError {
     #[error(transparent)]
-    ReadTxn(#[from] dbs::ReadTxnError),
+    ReadTxn(#[from] env::error::ReadTxn),
     #[error(transparent)]
-    TryGet(#[from] db_error::TryGet),
+    TryGet(#[from] db::error::TryGet),
 }
 
 impl ToStatus for TryGetCtipError {
@@ -74,9 +79,9 @@ impl ToStatus for TryGetCtipError {
 #[derive(Debug, Diagnostic, Error)]
 pub enum GetCtipsError {
     #[error(transparent)]
-    DbIter(#[from] db_error::Iter),
+    DbIter(#[from] db::error::Iter),
     #[error(transparent)]
-    ReadTxn(#[from] dbs::ReadTxnError),
+    ReadTxn(#[from] env::error::ReadTxn),
 }
 
 impl ToStatus for GetCtipsError {
@@ -91,9 +96,9 @@ impl ToStatus for GetCtipsError {
 #[derive(Debug, Diagnostic, Error)]
 pub enum TryGetCtipValueSeqError {
     #[error(transparent)]
-    DbTryGet(#[from] db_error::TryGet),
+    DbTryGet(#[from] db::error::TryGet),
     #[error(transparent)]
-    ReadTxn(#[from] dbs::ReadTxnError),
+    ReadTxn(#[from] env::error::ReadTxn),
 }
 
 impl ToStatus for TryGetCtipValueSeqError {
@@ -108,9 +113,9 @@ impl ToStatus for TryGetCtipValueSeqError {
 #[derive(Debug, Diagnostic, Error)]
 pub enum GetTreasuryUtxoError {
     #[error(transparent)]
-    DbGet(#[from] db_error::Get),
+    DbGet(#[from] db::error::Get),
     #[error(transparent)]
-    ReadTxn(#[from] dbs::ReadTxnError),
+    ReadTxn(#[from] env::error::ReadTxn),
 }
 
 impl ToStatus for GetTreasuryUtxoError {
@@ -127,7 +132,7 @@ enum GetHeaderInfoErrorInner {
     #[error(transparent)]
     GetHeaderInfo(#[from] dbs::block_hash_dbs_error::GetHeaderInfo),
     #[error(transparent)]
-    ReadTxn(#[from] dbs::ReadTxnError),
+    ReadTxn(#[from] env::error::ReadTxn),
 }
 
 impl ToStatus for GetHeaderInfoErrorInner {
@@ -162,9 +167,9 @@ impl ToStatus for GetHeaderInfoError {
 #[derive(Debug, Diagnostic, Error)]
 enum TryGetHeaderInfosErrorInner {
     #[error(transparent)]
-    ReadTxn(#[from] dbs::ReadTxnError),
+    Db(#[from] db::Error),
     #[error(transparent)]
-    TryGetHeaderInfo(#[from] dbs::block_hash_dbs_error::TryGetHeaderInfo),
+    ReadTxn(#[from] env::error::ReadTxn),
 }
 
 #[derive(Debug, Diagnostic, Error)]
@@ -184,7 +189,7 @@ where
 #[derive(Debug, Error)]
 enum GetBlockInfoErrorInner {
     #[error(transparent)]
-    ReadTxn(#[from] dbs::ReadTxnError),
+    ReadTxn(#[from] env::error::ReadTxn),
     #[error(transparent)]
     GetBlockInfo(#[from] dbs::block_hash_dbs_error::GetBlockInfo),
 }
@@ -206,11 +211,9 @@ where
 #[derive(Debug, Error)]
 enum TryGetBlockInfosErrorInner {
     #[error(transparent)]
-    ReadTxn(#[from] dbs::ReadTxnError),
+    Db(#[from] db::Error),
     #[error(transparent)]
-    TryGetBlockInfo(#[from] dbs::block_hash_dbs_error::TryGetBlockInfo),
-    #[error(transparent)]
-    TryGetHeaderInfo(#[from] dbs::block_hash_dbs_error::TryGetHeaderInfo),
+    ReadTxn(#[from] env::error::ReadTxn),
 }
 
 #[derive(Debug, Error)]
@@ -252,7 +255,7 @@ where
 #[derive(Debug, Error)]
 enum GetTwoWayPegDataRangeErrorInner {
     #[error(transparent)]
-    ReadTxn(#[from] dbs::ReadTxnError),
+    ReadTxn(#[from] env::error::ReadTxn),
     #[error(transparent)]
     GetTwoWayPegDataRange(#[from] dbs::block_hash_dbs_error::GetTwoWayPegDataRange),
 }
@@ -274,17 +277,17 @@ where
 #[derive(Debug, Error)]
 pub enum ListHeadersError {
     #[error(transparent)]
-    Iter(#[from] db_error::Iter),
+    Iter(#[from] db::error::Iter),
     #[error(transparent)]
-    ReadTxn(#[from] dbs::ReadTxnError),
+    ReadTxn(#[from] env::error::ReadTxn),
 }
 
 #[derive(Debug, Diagnostic, Error)]
 pub enum TryGetMainchainTipError {
     #[error(transparent)]
-    DbTryGet(#[from] dbs::db_error::TryGet),
+    DbTryGet(#[from] db::error::TryGet),
     #[error(transparent)]
-    ReadTxn(#[from] dbs::ReadTxnError),
+    ReadTxn(#[from] env::error::ReadTxn),
 }
 
 impl ToStatus for TryGetMainchainTipError {
@@ -299,9 +302,9 @@ impl ToStatus for TryGetMainchainTipError {
 #[derive(Debug, Diagnostic, Error)]
 pub enum GetMainchainTipError {
     #[error(transparent)]
-    DbGet(#[from] dbs::db_error::Get),
+    DbGet(#[from] db::error::Get),
     #[error(transparent)]
-    ReadTxn(#[from] dbs::ReadTxnError),
+    ReadTxn(#[from] env::error::ReadTxn),
 }
 
 impl ToStatus for GetMainchainTipError {
@@ -316,11 +319,11 @@ impl ToStatus for GetMainchainTipError {
 #[derive(Debug, Diagnostic, Error)]
 pub enum TryGetMainchainTipHeightError {
     #[error(transparent)]
-    DbGet(#[from] dbs::db_error::Get),
+    DbGet(#[from] db::error::Get),
     #[error(transparent)]
-    DbTryGet(#[from] dbs::db_error::TryGet),
+    DbTryGet(#[from] db::error::TryGet),
     #[error(transparent)]
-    ReadTxn(#[from] dbs::ReadTxnError),
+    ReadTxn(#[from] env::error::ReadTxn),
 }
 
 impl ToStatus for TryGetMainchainTipHeightError {
@@ -336,17 +339,17 @@ impl ToStatus for TryGetMainchainTipHeightError {
 #[derive(Debug, Error)]
 pub enum TryGetBmmCommitmentsError {
     #[error(transparent)]
-    DbTryGet(#[from] dbs::db_error::TryGet),
+    DbTryGet(#[from] db::error::TryGet),
     #[error(transparent)]
-    ReadTxn(#[from] dbs::ReadTxnError),
+    ReadTxn(#[from] env::error::ReadTxn),
 }
 
 #[derive(Debug, Diagnostic, Error)]
 pub enum GetPendingWithdrawalsError {
     #[error(transparent)]
-    DbGet(#[from] dbs::db_error::Get),
+    DbGet(#[from] db::error::Get),
     #[error(transparent)]
-    ReadTxn(#[from] dbs::ReadTxnError),
+    ReadTxn(#[from] env::error::ReadTxn),
 }
 
 impl ToStatus for GetPendingWithdrawalsError {
@@ -356,6 +359,14 @@ impl ToStatus for GetPendingWithdrawalsError {
             Self::ReadTxn(err) => StatusBuilder::new(err),
         }
     }
+}
+
+#[derive(Debug, Diagnostic, Error)]
+pub enum GetSeenBmmRequestsForParentBlockError {
+    #[error(transparent)]
+    DbRange(#[from] db::error::Range),
+    #[error(transparent)]
+    ReadTxn(#[from] env::error::ReadTxn),
 }
 
 #[derive(Debug, Diagnostic, Error)]
@@ -375,9 +386,9 @@ impl ToStatus for EventsStreamError {
 #[derive(Debug, Diagnostic, Error)]
 pub enum GetSidechainsError {
     #[error(transparent)]
-    DbIter(#[from] db_error::Iter),
+    DbIter(#[from] db::error::Iter),
     #[error(transparent)]
-    ReadTxn(#[from] dbs::ReadTxnError),
+    ReadTxn(#[from] env::error::ReadTxn),
 }
 
 impl ToStatus for GetSidechainsError {
@@ -429,7 +440,9 @@ impl Validator {
         self.network
     }
 
-    pub fn subscribe_events(&self) -> impl FusedStream<Item = Result<Event, EventsStreamError>> {
+    pub fn subscribe_events(
+        &self,
+    ) -> impl FusedStream<Item = Result<Event, EventsStreamError>> + use<> {
         futures::stream::try_unfold(self.events_rx.activate_cloned(), |mut receiver| async {
             match receiver.recv_direct().await {
                 Ok(event) => Ok(Some((event, receiver))),
@@ -454,9 +467,9 @@ impl Validator {
             .dbs
             .proposal_id_to_sidechain
             .iter(&rotxn)
-            .map_err(db_error::Iter::from)?
+            .map_err(db::error::Iter::from)?
             .collect()
-            .map_err(db_error::Iter::from)?;
+            .map_err(db::error::Iter::from)?;
         Ok(res)
     }
 
@@ -467,13 +480,13 @@ impl Validator {
             .active_sidechains
             .sidechain()
             .iter(&rotxn)
-            .map_err(db_error::Iter::from)?
+            .map_err(db::error::Iter::from)?
             .map(|(_sidechain_number, sidechain)| {
                 assert!(sidechain.status.activation_height.is_some());
                 Ok(sidechain)
             })
             .collect()
-            .map_err(db_error::Iter::from)?;
+            .map_err(db::error::Iter::from)?;
         Ok(res)
     }
 
@@ -529,8 +542,8 @@ impl Validator {
             .active_sidechains
             .ctip()
             .iter(&rotxn)
-            .map_err(db_error::Iter::from)?
-            .map_err(db_error::Iter::from)
+            .map_err(db::error::Iter::from)?
+            .map_err(db::error::Iter::from)
             .collect()?;
         Ok(res)
     }
@@ -656,7 +669,7 @@ impl Validator {
             .block_hashes
             .height()
             .iter(&rotxn)
-            .map_err(db_error::Iter::from)?
+            .map_err(db::error::Iter::from)?
             .filter_map(|(block_hash, height)| {
                 if height >= start_height {
                     Ok(Some((height, block_hash)))
@@ -665,36 +678,37 @@ impl Validator {
                 }
             })
             .collect()
-            .map_err(db_error::Iter::from)?;
+            .map_err(db::error::Iter::from)?;
 
         res.sort_by(|(first_height, _), (second_height, _)| first_height.cmp(second_height));
 
-        debug_assert!(res
-            .clone()
-            .is_sorted_by(|(first_height, _), (second_height, _)| {
-                first_height < second_height
-            }));
+        debug_assert!(
+            res.clone()
+                .is_sorted_by(|(first_height, _), (second_height, _)| {
+                    first_height < second_height
+                })
+        );
         Ok(res)
     }
 
     /// Get the mainchain tip. Returns `None` if not synced
     pub fn try_get_mainchain_tip(&self) -> Result<Option<BlockHash>, TryGetMainchainTipError> {
         let rotxn = self.dbs.read_txn()?;
-        let res = self.dbs.current_chain_tip.try_get(&rotxn, &dbs::UnitKey)?;
+        let res = self.dbs.current_chain_tip.try_get(&rotxn, &())?;
         Ok(res)
     }
 
     /// Get the mainchain tip. Returns an error if not synced
     pub fn get_mainchain_tip(&self) -> Result<BlockHash, GetMainchainTipError> {
         let rotxn = self.dbs.read_txn()?;
-        let res = self.dbs.current_chain_tip.get(&rotxn, &dbs::UnitKey)?;
+        let res = self.dbs.current_chain_tip.get(&rotxn, &())?;
         Ok(res)
     }
 
     /// Get the mainchain tip height. Returns `None` if not synced
     pub fn try_get_block_height(&self) -> Result<Option<u32>, TryGetMainchainTipHeightError> {
         let rotxn = self.dbs.read_txn()?;
-        let Some(tip) = self.dbs.current_chain_tip.try_get(&rotxn, &dbs::UnitKey)? else {
+        let Some(tip) = self.dbs.current_chain_tip.try_get(&rotxn, &())? else {
             return Ok(None);
         };
         let height = self.dbs.block_hashes.height().get(&rotxn, &tip)?;
@@ -757,6 +771,21 @@ impl Validator {
             .active_sidechains
             .pending_m6ids()
             .get(&rotxn, sidechain_number)?;
+        Ok(res)
+    }
+
+    pub fn get_seen_bmm_requests_for_parent_block(
+        &self,
+        parent_block_hash: BlockHash,
+    ) -> Result<
+        HashMap<SidechainNumber, HashMap<BmmCommitment, HashSet<Txid>>>,
+        GetSeenBmmRequestsForParentBlockError,
+    > {
+        let rotxn = self.dbs.read_txn()?;
+        let res = self
+            .dbs
+            .block_hashes
+            .get_seen_bmm_requests_for_parent_block(&rotxn, parent_block_hash)?;
         Ok(res)
     }
 
